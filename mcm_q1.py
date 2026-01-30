@@ -1,26 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-MCM 2026 Problem B — Paper-Friendly Planner (V10.1 Realistic)
+MCM 2026 Problem B — Paper-Friendly Planner (V10.3 Q1-XY-Unified)
 
-Goal: finish M_TOTAL_GOAL tons within a target horizon (Q1 default ~150y).
-
-Design philosophy (paper-friendly, explainable, NOT overly complex):
-1) No pipeline delay: delivered this year is usable this year. (Upper-bound-ish, but still realistic by capacities.)
-2) No safety stock constraint in construction: all delivered B/K can go to build (after optional sustain reservation).
-3) Sustain module default OFF (can enable for sensitivity, still simple).
-4) Routing ignores carbon in Q1 score (as requirement). Carbon tax remains in cost.
-
-Key "good points" kept:
-- Stoichiometric construction (B/K limiting factor): build is limited by shortboard.
-- Push bounded by remaining goal (avoid end-game overstock artifacts).
-- Pull driven by annual build target (logistic construction capacity).
-- SE_INV_EFF investment effectiveness (kept as a simple multiplier on SE invest effect).
-- Parameter scan + sensitivity overrides + robustness Monte Carlo
-- Rich history for explainable plots/tables
+What changed vs your V10.2 (minimal + aligned to your modeling lead):
+- Replace (alpha, beta) with (x, y) as two "scheme weights / utilization intensities".
+  * x in [0,1]: TR (rocket) utilization intensity (0=off, 1=full baseline)
+  * y in [0,1]: SE (space elevator) utilization intensity (0=off, 1=full baseline)
+- Space elevator DOES NOT grow scale. Maintenance is a constant availability loss:
+  * SE_UTIL = 0.95 (constant), NOT a decision variable.
+- Remove SE "invest/upgrade" split entirely (no SE_budget_invest, no (1-beta)).
+- Keep a simple TR support fraction as a constant (paper-friendly):
+  * TR_MOON_FRAC = 0.85 (rest goes to "support/apex logistics" cost proxy)
+- Q1 CSV outputs focus on duration + cost + TR/SE contribution shares (no carbon columns).
 
 Outputs:
-- Q1_Scan_Final.csv
-- Q1_Best_Trajectory.csv
+- Q1_Scan_Final.csv      (scan x,y grid)
+- Q1_Best_Trajectory.csv (trajectory for chosen best (x,y))
+- Q1_ThreeSchemes.csv    (TR-only / SE-only / Hybrid (x,y) unified)
 - Q1_Sensitivity.csv
 - Q1_Robustness.csv
 """
@@ -29,27 +25,35 @@ import math
 import csv
 import random
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 
 # ==============================================================================
-# 0) Global Parameters (Realistic Defaults)
+# 0) Global Parameters (keep your latest edits where possible)
 # ==============================================================================
 # Mission goal
 M_TOTAL_GOAL = 1e8          # total infrastructure tonnage
-T_MAX = 250                 # simulation horizon
+T_MAX = 1000                # simulation horizon
 START_YEAR = 2050
 
-# -------- Construction capacity (THIS WAS THE MAIN "too fast" knob before) ----
-# Choose mature upper bound ~ 1.0-2.0 Mt/year to make 80-150y plausible for 1e8.
-MAX_ANNUAL_BUILD = 1.2e6    # realistic-ish mature build ceiling (ton/year)
+# ---- Unified weights (decision variables) ----
+# x: TR utilization intensity in [0,1]
+# y: SE utilization intensity in [0,1]
+
+# ---- Constant assumptions for Q1 paper-friendliness ----
+SE_UTIL = 0.95              # constant elevator availability after maintenance/overhead
+TR_MOON_FRAC = 0.85         # constant fraction of TR capacity used for Moon cargo
+# (1-TR_MOON_FRAC) is "support/apex logistics" proxy
+
+# -------- Construction capacity (key realism knob) ----------------------------
+MAX_ANNUAL_BUILD = 1.2e6    # mature build ceiling (ton/year)
 LOGISTIC_BUILD_K = 0.15
-LOGISTIC_BUILD_MID = 2076   # later maturity than "fastpaper"
+LOGISTIC_BUILD_MID = 2076
 
 # Supply chain ratios for construction (stoichiometric limiting)
 RHO_BUILD = {'U': 0.00, 'K': 0.10, 'B': 0.90}  # build 1 ton needs 0.9B + 0.1K
 
-# -------- Optional sustain module (still simple; default OFF) -----------------
+# -------- Optional sustain module (default OFF) -------------------------------
 ENABLE_SUSTAIN = False
 P0 = 1e5
 LOGISTIC_DEMAND_K = 0.2
@@ -64,43 +68,35 @@ MODES = {
     'SE': {'L': 0.10, 'CostF': 'Calc', 'CarbF': 'Calc'}
 }
 
-# Routing score weights (Q1 ignores carbon by requirement)
-W_TIME = 1e5
-W_CARB = 5.0
+# -------- Traditional rocket (TR) economics ----------------------------------
+cTR_Base = 3.0e6            # $/ton baseline TR moon cargo
+cTR_Apex_Ratio = 0.65       # support/apex leg relative cost
+eTR_Base = 5000.0           # kgCO2e/ton (proxy, not output in Q1)
 
-# -------- Traditional rocket (TR) economics (paper: "effective marginal") -----
-# Keep costs in a plausible order, and do sensitivity later.
-cTR_Base = 3.0e6            # $/ton (baseline TR moon cargo)
-cTR_Apex_Ratio = 0.65       # apex leg relative cost
-eTR_Base = 5000.0           # kgCO2e/ton (proxy)
-
-# Discount & carbon tax
+# Discount & carbon tax (carbon not output in Q1 CSVs)
 R_DISC = 0.05
 CARBON_TAX = 50.0
 
 # Latitude penalty (small)
 LAT_PENALTY_WEIGHT = 0.03
 
-# TR capacity growth (was 0.06 too strong); use 0.02/yr linear multiplier
+# TR capacity growth (mild linear)
 TR_TECH_GROWTH = 0.02
 
-# -------- Space elevator baseline anchored to the problem statement ----------
-# Problem statement: "Galactic Harbour system can transport 179,000 tons/year".
-# We anchor total SE system throughput to 1.79e5 ton/year by default.
-SE_TOTAL_CAP_ANCHOR = 1.79e5
-
-# We keep "ports" notion for paper (3 harbours), split anchor across ports.
+# -------- Space elevator baseline (your updated interpretation) ---------------
+# You updated system total to 5.37e5 (instead of 1.79e5). Keep it.
+SE_TOTAL_CAP_ANCHOR = 5.37e5  # ton/year (SYSTEM total, fixed scale)
 PORTS_DEFAULT = 3
-SE_CAP_PER_PORT_BASE = SE_TOTAL_CAP_ANCHOR / PORTS_DEFAULT  # ≈ 59666.7 ton/yr/port
+SE_CAP_PER_PORT_BASE = SE_TOTAL_CAP_ANCHOR / PORTS_DEFAULT
 
-# SE OPEX & parasitic payload (kept simple but physical-ish)
+# SE OPEX & parasitic payload
 Re, h_apex = 6.37e6, 1e8
 r_apex = Re + h_apex
 mu_e, omega, g0 = 3.986e14, 7.292e-5, 9.81
 
-# Ferry from apex to lunar transfer: simplified dV & Isp for fuel ratio
+# Ferry from apex to lunar transfer: simplified fuel ratio (your edited Isp)
 dV_ferry = 1800.0
-Isp_ferry = 350.0
+Isp_ferry = 2000.0
 FUEL_PRICE = 8e4            # $/ton fuel
 FUEL_RATIO = math.exp(dV_ferry / (Isp_ferry * g0)) - 1
 
@@ -112,17 +108,12 @@ C_SE_OPEX_BASE = 8e3
 eSE_base = 20.0
 eSE_energy = 0.05
 
-# SE investment effectiveness (kept)
+# We keep SE_INV_EFF defined but unused in Q1 (no scaling growth)
 SE_INV_EFF = 0.8
-
-# Q1 cap multiplier (keep conservative = 1.0)
-CAP_MULT_Q1 = 1.0
 
 
 # ==============================================================================
 # 1) Launch Site Network (exactly 10)
-#    Realistic scaling: previous "hundreds of thousands ton/year/site" is too high.
-#    We scale down to tens of thousands ton/year/site.
 # ==============================================================================
 RAW_SITES = [
     ("Alaska_US",           64.8, 260000),
@@ -138,7 +129,7 @@ RAW_SITES = [
 ]
 
 # Capacity scale factor for realism
-TR_CAP_SCALE = 0.08  # 8% of previous: brings global TR to ~0.2-0.6 Mt/year range
+TR_CAP_SCALE = 0.08
 
 
 @dataclass
@@ -160,10 +151,7 @@ class TRSite:
         return (base_carb * mode_factor) / max(self.k_lat, 1e-9)
 
 
-SITE_NETWORK: List[TRSite] = [
-    TRSite(n, l, c * TR_CAP_SCALE) for n, l, c in RAW_SITES
-]
-# sort by effective cost (paper: "best sites utilized first")
+SITE_NETWORK: List[TRSite] = [TRSite(n, l, c * TR_CAP_SCALE) for n, l, c in RAW_SITES]
 SITE_NETWORK.sort(key=lambda s: s.eff_cost(cTR_Base, 1.0))
 
 
@@ -171,17 +159,14 @@ SITE_NETWORK.sort(key=lambda s: s.eff_cost(cTR_Base, 1.0))
 # 2) Helpers
 # ==============================================================================
 def logistic_curve(t: int, start_val: float, end_val: float, midpoint: int, k: float) -> float:
-    """A smooth ramp from start_val to end_val."""
     return end_val + (start_val - end_val) / (1 + math.exp(k * (t - midpoint)))
 
 
 def unit_work_J_per_kg() -> float:
-    """Energy to raise 1 kg from Earth to apex (proxy)."""
     return mu_e * (1 / Re - 1 / r_apex) - 0.5 * omega**2 * (r_apex**2 - Re**2)
 
 
-def calc_se_opex(ovr: Optional[Dict] = None):
-    """SE cost/carbon per ton lifted, with safe clamp."""
+def calc_se_opex(ovr: Optional[Dict] = None) -> Tuple[float, float]:
     price = (ovr.get('E_PRICE', E_PRICE) if ovr else E_PRICE)
     eff = (ovr.get('ENERGY_EFF', ENERGY_EFF) if ovr else ENERGY_EFF)
     base = (ovr.get('C_SE_OPEX_BASE', C_SE_OPEX_BASE) if ovr else C_SE_OPEX_BASE)
@@ -203,46 +188,35 @@ def cheapest_tr_carb(base_carb: float, mode: str) -> float:
     return best.eff_carb(base_carb, MODES[mode]['CarbF'])
 
 
+def clamp01(v: float) -> float:
+    return max(0.0, min(1.0, float(v)))
+
+
 # ==============================================================================
 # 3) Config
 # ==============================================================================
 @dataclass
 class SimConfig:
-    is_Q1: bool = True
-    consider_carbon_in_routing_score: bool = False
     enable_sustain: bool = ENABLE_SUSTAIN
-    cap_mult_q1: float = CAP_MULT_Q1
 
 
 def get_config_Q1():
-    return SimConfig(is_Q1=True,
-                     consider_carbon_in_routing_score=False,
-                     enable_sustain=ENABLE_SUSTAIN,
-                     cap_mult_q1=CAP_MULT_Q1)
-
-
-def get_config_Q2():
-    return SimConfig(is_Q1=False,
-                     consider_carbon_in_routing_score=False,
-                     enable_sustain=ENABLE_SUSTAIN,
-                     cap_mult_q1=CAP_MULT_Q1)
+    return SimConfig(enable_sustain=ENABLE_SUSTAIN)
 
 
 # ==============================================================================
 # 4) Simulation Engine (paper-friendly, no pipeline delay)
 # ==============================================================================
-def simulate_scenario(alpha: float, beta: float, cfg: SimConfig, overrides: Optional[Dict] = None):
+def simulate_scenario(x: float, y: float, cfg: SimConfig, overrides: Optional[Dict] = None):
     """
-    Decision variables:
-    alpha: fraction of TR capacity allocated to Moon cargo (rest to apex support)
-    beta:  fraction of SE capacity used for Moon lift (rest for investment/support lift)
-
-    State:
-    cum_M: completed infrastructure tonnage
+    x: TR utilization intensity in [0,1]
+    y: SE utilization intensity in [0,1]
     """
     ovr = overrides if overrides else {}
+    x = clamp01(x)
+    y = clamp01(y)
 
-    # overrides
+    # overrides: economics
     p_cTR = ovr.get('cTR_Base', cTR_Base)
     p_eTR = ovr.get('eTR_Base', eTR_Base)
     p_tax = ovr.get('CARBON_TAX', CARBON_TAX)
@@ -255,36 +229,35 @@ def simulate_scenario(alpha: float, beta: float, cfg: SimConfig, overrides: Opti
     p_log_mid = ovr.get('LOGISTIC_BUILD_MID', LOGISTIC_BUILD_MID)
     p_log_k = ovr.get('LOGISTIC_BUILD_K', LOGISTIC_BUILD_K)
 
-    # elevator capacity anchored
+    # SE capacity anchored (fixed scale, but allow sensitivity overrides)
     ports = int(ovr.get('PORTS_DEFAULT', PORTS_DEFAULT))
     se_cap_per_port = float(ovr.get('SE_CAP_PER_PORT_BASE', SE_CAP_PER_PORT_BASE))
-    cse_base = ports * se_cap_per_port
+    se_fixed_total = ports * se_cap_per_port  # fixed baseline (no growth)
+
+    # allow overriding SE utilization constant (rare; keep default)
+    se_util = float(ovr.get('SE_UTIL', SE_UTIL))
+    se_util = max(0.0, min(1.0, se_util))
 
     cSE_op, eSE_op = calc_se_opex(ovr)
 
-    # Q1: fixed cap_mult
-    if cfg.is_Q1:
-        cap_mult = max(1.0, float(cfg.cap_mult_q1))
-        # investment effectiveness: treat as a simple multiplier on invest budget
-        A, eta = 1.0, 1.0
-    else:
-        cap_mult = 1.0
-        A, eta = 0.9, 0.8
-
     cum_M = 0.0
     cum_NPV = 0.0
-    cum_Carb = 0.0
     cum_undisc = 0.0
+    cum_Carb_internal = 0.0  # internal only
+
+    # contribution accounting
+    cum_TR_moon_ship = 0.0
+    cum_SE_moon_ship = 0.0
 
     history = []
     finish_year = START_YEAR + T_MAX
     is_finished = False
 
     for t in range(START_YEAR, START_YEAR + T_MAX + 1):
-        # --- Annual build target via logistic construction capacity ---
+        # --- Annual build target ---
         build_cap_limit = logistic_curve(
             t,
-            p_max_build * 0.15,   # early stage smaller
+            p_max_build * 0.15,
             p_max_build,
             p_log_mid,
             p_log_k
@@ -300,7 +273,6 @@ def simulate_scenario(alpha: float, beta: float, cfg: SimConfig, overrides: Opti
             sus_B = D_sus_tot * RHO_SUS['B']
             sus_K = D_sus_tot * RHO_SUS['K']
         else:
-            D_sus_tot = 0.0
             sus_B = 0.0
             sus_K = 0.0
 
@@ -308,25 +280,29 @@ def simulate_scenario(alpha: float, beta: float, cfg: SimConfig, overrides: Opti
         need_B = annual_build_target * RHO_BUILD['B']
         need_K = annual_build_target * RHO_BUILD['K']
 
-        # --- TR total capacity with mild tech progress ---
+        # --- TR total capacity (baseline) with tech progress, then scaled by x ---
         mult = 1.0 + TR_TECH_GROWTH * (t - START_YEAR)
-        TR_total_cap = sum(s.base_cap * s.k_lat for s in SITE_NETWORK) * mult
-        TR_budget_moon = TR_total_cap * alpha
-        TR_budget_apex = TR_total_cap * (1.0 - alpha)
+        TR_total_cap_baseline = sum(s.base_cap * s.k_lat for s in SITE_NETWORK) * mult
 
-        # --- SE total capacity (anchored) ---
-        SE_total = cse_base * cap_mult * A * eta
-        SE_budget_invest = SE_total * (1.0 - beta)
-        SE_budget_moon_total_lift = SE_total * beta
-        SE_budget_moon_cargo = SE_budget_moon_total_lift / (1.0 + FUEL_RATIO)
+        # allow overriding TR scale (for stress tests)
+        tr_scale_mult = float(ovr.get('TR_SCALE_MULT', 1.0))
+        TR_total_cap = TR_total_cap_baseline * max(0.0, tr_scale_mult) * x
 
-        # ---- Allocation Policy (paper-friendly planner) ----
+        TR_moon_cap = TR_total_cap * TR_MOON_FRAC
+        TR_support_cap = TR_total_cap * (1.0 - TR_MOON_FRAC)
+
+        # --- SE moon cargo capacity (fixed scale, no growth), scaled by y and constant util ---
+        # total lift available after maintenance: se_fixed_total * se_util * y
+        # cargo available after ferry fuel mass: / (1 + FUEL_RATIO)
+        SE_moon_cargo_cap = (se_fixed_total * se_util * y) / (1.0 + FUEL_RATIO)
+
+        # ---- Allocation Policy ----
         # Priority: sustain first, then construction K then B.
         # Any surplus cargo: push B but bounded by remain_goal.
 
         # 1) SE cargo -> K then B
-        K_from_SE = min(SE_budget_moon_cargo, sus_K + need_K)
-        rem_SE = SE_budget_moon_cargo - K_from_SE
+        K_from_SE = min(SE_moon_cargo_cap, sus_K + need_K)
+        rem_SE = SE_moon_cargo_cap - K_from_SE
 
         B_from_SE = min(rem_SE, sus_B + need_B)
         rem_SE -= B_from_SE
@@ -335,8 +311,8 @@ def simulate_scenario(alpha: float, beta: float, cfg: SimConfig, overrides: Opti
         B_from_SE += push_B_SE
 
         # 2) TR moon cargo -> K then B
-        K_from_TR = min(TR_budget_moon, sus_K + max(0.0, need_K - K_from_SE))
-        rem_TR = TR_budget_moon - K_from_TR
+        K_from_TR = min(TR_moon_cap, sus_K + max(0.0, need_K - K_from_SE))
+        rem_TR = TR_moon_cap - K_from_TR
 
         B_from_TR = min(rem_TR, sus_B + max(0.0, need_B - B_from_SE))
         rem_TR -= B_from_TR
@@ -368,51 +344,53 @@ def simulate_scenario(alpha: float, beta: float, cfg: SimConfig, overrides: Opti
             build_done = max(0.0, build_done)
             cum_M += build_done
 
-        # ---- Costs (simple + explainable) ----
+        # ---- Costs (computed; carbon not output in Q1 CSVs) ----
         unit_tr_cost = cheapest_tr_unit(p_cTR, 'B')
         unit_tr_carb = cheapest_tr_carb(p_eTR, 'B')
-        tr_moon_ship = (K_from_TR + B_from_TR)
 
+        tr_moon_ship = (K_from_TR + B_from_TR)
+        se_moon_ship = (K_from_SE + B_from_SE)
+
+        cum_TR_moon_ship += tr_moon_ship
+        cum_SE_moon_ship += se_moon_ship
+
+        # TR Moon cost
         tr_moon_cost = tr_moon_ship * unit_tr_cost
         tr_moon_carb = tr_moon_ship * unit_tr_carb
 
-        # TR apex (support) cost proxy
-        tr_apex_cost = TR_budget_apex * cheapest_tr_unit(p_cTR * cTR_Apex_Ratio, 'B')
-        tr_apex_carb = TR_budget_apex * cheapest_tr_carb(p_eTR * cTR_Apex_Ratio, 'B')
+        # TR support cost proxy (apex/support)
+        tr_support_cost = TR_support_cap * cheapest_tr_unit(p_cTR * cTR_Apex_Ratio, 'B')
+        tr_support_carb = TR_support_cap * cheapest_tr_carb(p_eTR * cTR_Apex_Ratio, 'B')
 
         # SE opex: total lift includes parasitic ferry fuel mass
-        se_moon_total_lift = (K_from_SE + B_from_SE) * (1.0 + FUEL_RATIO)
-        # investment lift scaled by effectiveness (paper: "investment tonnage produces SE_INV_EFF effect")
-        se_invest_lift = SE_budget_invest
-        se_load_total = se_moon_total_lift + se_invest_lift
-
-        cost_se = se_load_total * cSE_op
-        carb_se = se_load_total * eSE_op
+        se_moon_total_lift = se_moon_ship * (1.0 + FUEL_RATIO)
+        cost_se = se_moon_total_lift * cSE_op
+        carb_se = se_moon_total_lift * eSE_op
 
         # ferry fuel purchase
-        ferry_fuel = (K_from_SE + B_from_SE) * FUEL_RATIO
+        ferry_fuel = se_moon_ship * FUEL_RATIO
         cost_ferry = ferry_fuel * p_fuel
         carb_ferry = ferry_fuel * 400.0  # proxy
 
-        carb_tot = tr_moon_carb + tr_apex_carb + carb_se + carb_ferry
+        carb_tot = tr_moon_carb + tr_support_carb + carb_se + carb_ferry
         tax = (carb_tot / 1000.0) * p_tax
 
-        cost_tot = tr_moon_cost + tr_apex_cost + cost_se + cost_ferry + stockout_cost + tax
+        cost_tot = tr_moon_cost + tr_support_cost + cost_se + cost_ferry + stockout_cost + tax
 
         npv_add = cost_tot / ((1.0 + p_disc) ** (t - START_YEAR))
         cum_NPV += npv_add
         cum_undisc += cost_tot
-        cum_Carb += carb_tot
+        cum_Carb_internal += carb_tot
 
         history.append({
             'Year': t,
-            'Alpha': alpha, 'Beta': beta,
-            'TR_total_cap': TR_total_cap,
+            'x': x,
+            'y': y,
+            'TR_total_cap_used': TR_total_cap,
             'TR_moon': tr_moon_ship,
-            'TR_apex': TR_budget_apex,
-            'SE_total': SE_total,
-            'SE_moon_cargo': (K_from_SE + B_from_SE),
-            'SE_invest': SE_budget_invest,
+            'TR_support': TR_support_cap,
+            'SE_fixed_total': se_fixed_total,
+            'SE_moon_cargo': se_moon_ship,
             'Delivered_K': delivered_K,
             'Delivered_B': delivered_B,
             'Build_Target': annual_build_target,
@@ -421,7 +399,7 @@ def simulate_scenario(alpha: float, beta: float, cfg: SimConfig, overrides: Opti
             'Remain_Goal': max(0.0, p_M_total - cum_M),
             'Cost_Year': cost_tot,
             'NPV_Cum': cum_NPV,
-            'Carb_Cum': cum_Carb
+            'Carb_Cum_Internal': cum_Carb_internal,
         })
 
         if cum_M >= p_M_total - 1e-9:
@@ -429,36 +407,58 @@ def simulate_scenario(alpha: float, beta: float, cfg: SimConfig, overrides: Opti
             is_finished = True
             break
 
+    total_moon_ship = cum_TR_moon_ship + cum_SE_moon_ship
+    tr_share = (cum_TR_moon_ship / total_moon_ship) if total_moon_ship > 0 else 0.0
+    se_share = (cum_SE_moon_ship / total_moon_ship) if total_moon_ship > 0 else 0.0
+
     summary = {
         'Duration': finish_year - START_YEAR,
-        'Total_NPV': cum_NPV,
-        'Total_Carbon': cum_Carb,
-        'Total_Undiscounted_Cost': cum_undisc,
         'Finished': is_finished,
-        'Alpha': alpha,
-        'Beta': beta
+        'x': x,
+        'y': y,
+        'Total_NPV': cum_NPV,
+        'Total_Undiscounted_Cost': cum_undisc,
+
+        # Contribution (what you want in CSV)
+        'TR_Moon_Total': cum_TR_moon_ship,
+        'SE_Moon_Total': cum_SE_moon_ship,
+        'TR_Share': tr_share,
+        'SE_Share': se_share,
+
+        # Internal only (not reported in Q1 CSVs)
+        'Total_Carbon_Internal': cum_Carb_internal,
     }
     return summary, history
 
 
 # ==============================================================================
-# 5) Analysis Tools
+# 5) Analysis Tools (Q1 reporting: no carbon columns)
 # ==============================================================================
-def run_parameter_scan(cfg: SimConfig, out_csv='Q1_Scan_Final.csv'):
-    print(f">>> Running Parameter Scan -> {out_csv}")
-    alphas = [round(x * 0.05, 2) for x in range(21)]  # 0..1 step 0.05
-    betas = [0.8, 0.85, 0.9, 0.95, 1.0]
+def run_parameter_scan(cfg: SimConfig, out_csv='Q1_Scan_Final.csv',
+                       step: float = 0.05):
+    """
+    Scan a grid over (x,y).
+    step=0.05 -> 21x21 = 441 cases (still fast).
+    """
+    print(f">>> Running Q1 Scan over (x,y) grid step={step} -> {out_csv}")
+    n = int(round(1.0 / step))
+    vals = [round(i * step, 2) for i in range(n + 1)]
+
     results = []
-    for a in alphas:
-        for b in betas:
-            s, _ = simulate_scenario(a, b, cfg)
+    for x in vals:
+        for y in vals:
+            s, _ = simulate_scenario(x, y, cfg)
             results.append({
+                'x': x,
+                'y': y,
                 'Duration': s['Duration'],
-                'Total_NPV': s['Total_NPV'],
-                'Total_Carbon': s['Total_Carbon'],
-                'Total_Undiscounted_Cost': s['Total_Undiscounted_Cost'],
                 'Finished': s['Finished'],
-                'Alpha': a, 'Beta': b
+                'Total_NPV': s['Total_NPV'],
+                'Total_Undiscounted_Cost': s['Total_Undiscounted_Cost'],
+                'TR_Share': s['TR_Share'],
+                'SE_Share': s['SE_Share'],
+                'TR_Moon_Total': s['TR_Moon_Total'],
+                'SE_Moon_Total': s['SE_Moon_Total'],
             })
 
     with open(out_csv, 'w', newline='', encoding='utf-8') as f:
@@ -466,49 +466,69 @@ def run_parameter_scan(cfg: SimConfig, out_csv='Q1_Scan_Final.csv'):
         w.writeheader()
         w.writerows(results)
     print("Saved:", out_csv)
+    return results
 
 
-def run_sensitivity(base_a, base_b, cfg: SimConfig, out_csv='Q1_Sensitivity.csv'):
-    print(f">>> Running Sensitivity -> {out_csv}")
+def pick_best_from_scan(scan_rows: List[Dict]) -> Tuple[float, float, Dict]:
+    """
+    Paper-friendly rule:
+    1) Prefer Finished=True
+    2) Minimize Duration
+    3) Tie-break by Total_Undiscounted_Cost
+    """
+    finished = [r for r in scan_rows if r['Finished']]
+    pool = finished if finished else scan_rows
+
+    pool.sort(key=lambda r: (r['Duration'], r['Total_Undiscounted_Cost']))
+    best = pool[0]
+    return float(best['x']), float(best['y']), best
+
+
+def run_sensitivity(base_x, base_y, cfg: SimConfig, out_csv='Q1_Sensitivity.csv'):
+    """
+    Sensitivity: duration/cost/shares (no carbon column).
+    """
+    print(f">>> Running Q1 Sensitivity -> {out_csv}")
     scenarios = [
         ('Base', {}),
         ('Tax_High', {'CARBON_TAX': 120}),
         ('Fuel_High', {'FUEL_PRICE': 1.6e5}),
         ('TR_Cost_Low', {'cTR_Base': 2.0e6}),
         ('TR_Cost_High', {'cTR_Base': 6.0e6}),
-        ('TR_Growth_Low', {'TR_TECH_GROWTH': 0.01}),  # handled below manually
-        ('TR_Growth_High', {'TR_TECH_GROWTH': 0.03}),
         ('SE_Cap_Low', {'SE_CAP_PER_PORT_BASE': (SE_TOTAL_CAP_ANCHOR * 0.7) / PORTS_DEFAULT}),
         ('SE_Cap_High', {'SE_CAP_PER_PORT_BASE': (SE_TOTAL_CAP_ANCHOR * 1.3) / PORTS_DEFAULT}),
         ('BuildCap_Low', {'MAX_ANNUAL_BUILD': 8e5}),
         ('BuildCap_High', {'MAX_ANNUAL_BUILD': 1.8e6}),
+        ('TR_MoonFrac_Low', {'TR_MOON_FRAC': 0.75}),  # handled below
+        ('TR_MoonFrac_High', {'TR_MOON_FRAC': 0.92}),
     ]
 
     rows = []
-    global TR_TECH_GROWTH
-    saved_growth = TR_TECH_GROWTH
+    global TR_MOON_FRAC
+    saved_frac = TR_MOON_FRAC
 
     for name, ovr in scenarios:
-        # Special-case TR growth override (global in this file)
-        if 'TR_TECH_GROWTH' in ovr:
-            TR_TECH_GROWTH = float(ovr['TR_TECH_GROWTH'])
+        if 'TR_MOON_FRAC' in ovr:
+            TR_MOON_FRAC = float(ovr['TR_MOON_FRAC'])
             ovr2 = dict(ovr)
-            del ovr2['TR_TECH_GROWTH']
+            del ovr2['TR_MOON_FRAC']
         else:
             ovr2 = ovr
 
-        s, _ = simulate_scenario(base_a, base_b, cfg, overrides=ovr2)
+        s, _ = simulate_scenario(base_x, base_y, cfg, overrides=ovr2)
         rows.append({
             'Scenario': name,
-            'Alpha': base_a, 'Beta': base_b,
+            'x': base_x,
+            'y': base_y,
             'Duration': s['Duration'],
             'Finished': s['Finished'],
             'Total_NPV': s['Total_NPV'],
             'Total_Undiscounted_Cost': s['Total_Undiscounted_Cost'],
-            'Total_Carbon': s['Total_Carbon'],
+            'TR_Share': s['TR_Share'],
+            'SE_Share': s['SE_Share'],
         })
 
-    TR_TECH_GROWTH = saved_growth
+    TR_MOON_FRAC = saved_frac
 
     with open(out_csv, 'w', newline='', encoding='utf-8') as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
@@ -517,11 +537,13 @@ def run_sensitivity(base_a, base_b, cfg: SimConfig, out_csv='Q1_Sensitivity.csv'
     print("Saved:", out_csv)
 
 
-def run_robustness(base_a, base_b, cfg: SimConfig, n_trials=50, out_csv='Q1_Robustness.csv'):
-    print(f">>> Running Robustness N={n_trials} -> {out_csv}")
+def run_robustness(base_x, base_y, cfg: SimConfig, n_trials=50, out_csv='Q1_Robustness.csv'):
+    """
+    Robustness: randomize SE capacity ±15%, build cap ±15%
+    """
+    print(f">>> Running Q1 Robustness N={n_trials} -> {out_csv}")
     rows = []
     for i in range(n_trials):
-        # Randomize: SE total capacity around anchor ±15%, build cap ±15%
         r_se = random.uniform(0.85, 1.15)
         r_build = random.uniform(0.85, 1.15)
 
@@ -530,15 +552,19 @@ def run_robustness(base_a, base_b, cfg: SimConfig, n_trials=50, out_csv='Q1_Robu
             'MAX_ANNUAL_BUILD': MAX_ANNUAL_BUILD * r_build
         }
 
-        s, _ = simulate_scenario(base_a, base_b, cfg, overrides=ovr)
+        s, _ = simulate_scenario(base_x, base_y, cfg, overrides=ovr)
         rows.append({
             'Trial': i,
             'r_se': r_se,
             'r_build': r_build,
+            'x': base_x,
+            'y': base_y,
             'Duration': s['Duration'],
             'Finished': s['Finished'],
             'Total_NPV': s['Total_NPV'],
-            'Total_Carbon': s['Total_Carbon'],
+            'Total_Undiscounted_Cost': s['Total_Undiscounted_Cost'],
+            'TR_Share': s['TR_Share'],
+            'SE_Share': s['SE_Share'],
         })
 
     with open(out_csv, 'w', newline='', encoding='utf-8') as f:
@@ -552,29 +578,64 @@ def run_robustness(base_a, base_b, cfg: SimConfig, n_trials=50, out_csv='Q1_Robu
 # 6) Main
 # ==============================================================================
 def main():
-    print("Start V10.1 Realistic Paper Planner...")
+    print("Start V10.3 Q1-XY-Unified Paper Planner...")
     cfg = get_config_Q1()
 
-    # scan
-    run_parameter_scan(cfg, out_csv='Q1_Scan_Final.csv')
+    # 1) Scan (x,y)
+    scan_rows = run_parameter_scan(cfg, out_csv='Q1_Scan_Final.csv', step=0.05)
 
-    # pick a candidate (you can change after seeing scan results)
-    # heuristic: give more TR to Moon, and SE mostly to Moon
-    best_a, best_b = 0.55, 0.95
-    s_best, h_best = simulate_scenario(best_a, best_b, cfg)
+    # 2) Pick best (paper-friendly rule)
+    best_x, best_y, best_row = pick_best_from_scan(scan_rows)
+    print(f">>> Picked best (x,y)=({best_x},{best_y}) | "
+          f"Finished={best_row['Finished']} | Duration={best_row['Duration']}")
 
+    # 3) Best trajectory
+    s_best, h_best = simulate_scenario(best_x, best_y, cfg)
     with open('Q1_Best_Trajectory.csv', 'w', newline='', encoding='utf-8') as f:
         w = csv.DictWriter(f, fieldnames=list(h_best[0].keys()))
         w.writeheader()
         w.writerows(h_best)
+    print("Saved: Q1_Best_Trajectory.csv")
 
-    run_sensitivity(best_a, best_b, cfg, out_csv='Q1_Sensitivity.csv')
-    run_robustness(best_a, best_b, cfg, n_trials=50, out_csv='Q1_Robustness.csv')
+    # 4) Three schemes unified in (x,y)
+    # TR-only: (1,0); SE-only: (0,1); Hybrid: (1,1)
+    schemes = [
+        ('TR_only', 1.0, 0.0),
+        ('SE_only', 0.0, 1.0),
+        ('Hybrid',  1.0, 1.0),
+    ]
+    three_rows = []
+    for name, x, y in schemes:
+        s, _ = simulate_scenario(x, y, cfg)
+        three_rows.append({
+            'Scheme': name,
+            'x': x,
+            'y': y,
+            'Duration': s['Duration'],
+            'Finished': s['Finished'],
+            'TR_Share': s['TR_Share'],
+            'SE_Share': s['SE_Share'],
+            'TR_Moon_Total': s['TR_Moon_Total'],
+            'SE_Moon_Total': s['SE_Moon_Total'],
+            'Total_NPV': s['Total_NPV'],
+            'Total_Undiscounted_Cost': s['Total_Undiscounted_Cost'],
+        })
+
+    with open('Q1_ThreeSchemes.csv', 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=list(three_rows[0].keys()))
+        w.writeheader()
+        w.writerows(three_rows)
+    print("Saved: Q1_ThreeSchemes.csv")
+
+    # 5) Sensitivity / Robustness around best (x,y)
+    run_sensitivity(best_x, best_y, cfg, out_csv='Q1_Sensitivity.csv')
+    run_robustness(best_x, best_y, cfg, n_trials=50, out_csv='Q1_Robustness.csv')
 
     print("\nAll Done.")
-    print(f"[Candidate] A={best_a}, B={best_b} -> "
+    print(f"[Best] x={best_x}, y={best_y} -> "
           f"Duration={s_best['Duration']}, Finished={s_best['Finished']}, "
-          f"NPV={s_best['Total_NPV']:.3e}")
+          f"Cost={s_best['Total_Undiscounted_Cost']:.3e}")
+
 
 if __name__ == "__main__":
     main()
